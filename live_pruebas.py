@@ -39,9 +39,9 @@ def load_sudormrf_causal_cpu(model_path):
     # 2: el passem a DataParallel perquè es va guardar com un DataParallel
     model = torch.nn.DataParallel(model)
     # 3: carreguem els pesos
-    model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+    model.load_state_dict(torch.load(model_path, map_location=torch.device('mps')))
     # 4: El pasem a GPU. Tu podries provar torch.device("mps") que seria la teva GPU
-    device = torch.device("cpu")
+    device = torch.device("mps")
     model = model.module.to(device)
     # 5: posem en mode Evaluació (es desactiva dropout i coses així)
     model.eval()
@@ -67,7 +67,7 @@ def get_parser():
         "--no_compressor", action="store_false", dest="compressor", #python -m denoiser.live --no_compressor
         help="Deactivate compressor on output, might lead to clipping.")
     parser.add_argument(
-        "--device", default="cpu") #python -m denoiser.live --device "cpu"
+        "--device", default="mps") #python -m denoiser.live --device "cpu"
     parser.add_argument(
         "--dry", type=float, default=0.04, #python -m denoiser.live --dry 0.04 
         help="Dry/wet knob, between 0 and 1. 0=maximum noise removal "
@@ -109,44 +109,33 @@ def query_devices(device, kind): #devuelve en 'caps' el dispositivo que elijamos
 
 
 def model_aplication(buffer, model):
-    #print(f"Buffer lenght: {len(buffer[0,:])}")
-    #print(f"Buffer shape: {buffer.shape}")
     # guardem l'energia de la mixture per poder normalitzar la sortida del model
     ini_nrg = torch.sum(buffer ** 2)
-    #print(f"Ini_nrg: {ini_nrg}")
     buffer = (buffer - torch.mean(buffer)) / torch.std(buffer)
-    #print(f"New buffer shape: {buffer.shape}")
 
+    # Código a medir
+    inicio = time.time()
     out = model(buffer.unsqueeze(0)).detach() #torch.Size([1,1,256]) con el audio sin ruido
-    #print(f"Out: {out.shape}")
+    fin = time.time()
+    print(f"Tiempo de ejecución del modelo: {fin-inicio}")
+
     out /= torch.sqrt(torch.sum(out ** 2) / ini_nrg)
     out = out[0,0,:] #torch.Size([256]) con el audio sin ruido
-    #print(f"New out: {out.shape}")
     return out
 
 
 def main():
+
+    mps_device = torch.device("mps")
+
     args = get_parser().parse_args() # en 'args' guardamos todos los argumentos que nosotros pasamos por terminal
     if args.num_threads: # Si añadimos un valor entero en el argumento num_threads
         torch.set_num_threads(args.num_threads) # Se establece el número de threads utilizado para las operaciones intra a la CPU.
 
     model_path = 'e39_sudo_whamr_16k_enhnoisy_augment.pt'
     model = load_sudormrf_causal_cpu(model_path)
-    #model = get_model(args).to(args.device) #carga el modelo con nuestros argumentos y los dispositivos seleccionados
     print("Model loaded.")
-    #streamer = DemucsStreamer(model, dry=args.dry, num_frames=args.num_frames) # Processs of resampling data??
 
-
-def main():
-    args = get_parser().parse_args() # en 'args' guardamos todos los argumentos que nosotros pasamos por terminal
-    if args.num_threads: # Si añadimos un valor entero en el argumento num_threads
-        torch.set_num_threads(args.num_threads) # Se establece el número de threads utilizado para las operaciones intra a la CPU.
-
-    model_path = 'e39_sudo_whamr_16k_enhnoisy_augment.pt'
-    model = load_sudormrf_causal_cpu(model_path)
-    #model = get_model(args).to(args.device) #carga el modelo con nuestros argumentos y los dispositivos seleccionados
-    print("Model loaded.")
-    #streamer = DemucsStreamer(model, dry=args.dry, num_frames=args.num_frames) # Processs of resampling data??
 
     sr=16000
     device_in = parse_audio_device(args.in_) # device_in = #python -m denoiser.live --in "MacBook Air (micrófono)"
@@ -187,8 +176,8 @@ def main():
 
     # Inicializamos el buffer como un tensor vacío
     BUFFER_SIZE = 1  # Número de chunks a almacenar en el buffer
-    buffer = torch.empty((1,0),dtype=torch.int64)
-    out = torch.empty((1,0),dtype=torch.int64)
+    buffer = torch.empty((1,0),dtype=torch.float32, device=mps_device)
+    out = torch.empty((1,0),dtype=torch.float32, device=mps_device)
 
     #print(f"Ready to process audio, total lag: {streamer.total_length / sr_ms:.1f}ms.") #Streamer.total_length = 661
     print("Ready to process audio:")
@@ -196,43 +185,27 @@ def main():
         try:
             if current_time > last_log_time + log_delta: # a cada 10 segundos se ejectua este condicional
                 last_log_time = current_time
-                #tpf = streamer.time_per_frame * 1000
-                #rtf = tpf / stride_ms
-                #print(f"time per frame: {tpf:.1f}ms, ", end='')
-                #print(f"RTF: {rtf:.1f}")
-                #streamer.reset_time_per_frame() #poner el total time y el frame a 0
                 print(f"Current time: {current_time:.1f}")
                 
             #print(current_time)
-            #length = streamer.total_length if first else streamer.stride #256 siempre excepto la primera iteración (661)
-            length = length1 if first else stride1
+            length = length1 if first else stride1 #256 siempre excepto la primera iteración (661)
             first = False #False siempre excepto la primera iteración
-            #current_time += length / model.sample_rate #Se actualiza cada 0.016 segundos
-            current_time += length / sr
+            current_time += length / sr #Se actualiza cada 0.016 segundos
             frame, overflow = stream_in.read(length) 
             # overflow = False or True
             # frame = numpy array of size (256,2)
 
             frame = torch.from_numpy(frame).mean(dim=1).to(args.device) # pasamos de stereo a mono haciendo el valor medio de las dos entradas de audio. También pasamos de un numpy array a un tensor.
             framePrueba = frame[None,:] #torch.Size([1, 256])
-            # inicialitzem l'energia de la mixture per poder normalitzar la sortida del model
-            ini_nrg = 0
  
-
             with torch.no_grad(): #para eliminar el atributo para calcular el gradiente de los tensors creados (en el caso de que lo tuviera)
                 buffer = torch.cat((buffer, framePrueba),1)
-                #print(f"Buffer: {buffer.shape}")
 
                 # Si el buffer está lleno, procesamos los chunks de audio y enviamos el output a la salida
                 if len(buffer[0,:]) >= length1 + (BUFFER_SIZE-1)*stride1:
 
-                    #Para calcular el tiempo de ejecución del modelo.
-                    inicio = time.time()
-                    # Código a medir
-                    out = model_aplication(buffer, model)
-                    fin = time.time()
-                    print(f"Tiempo de ejecución del modelo: {fin-inicio}")
-                
+                    out = model_aplication(buffer, model) 
+
                     if not out.numel(): #si la salida está vacía, vuelve al while (para evitar errores)
                         continue
                     if args.compressor: #entra siempre que no pongas --no compressor as input
@@ -248,11 +221,10 @@ def main():
                     if overflow or underflow:
                         if current_time >= last_error_time + cooldown_time:
                             last_error_time = current_time
-                            #tpf = 1000 * streamer.time_per_frame
                             print(f"Not processing audio fast enough should be less than {stride_ms:.1f}ms).")
                             
                     # Vaciamos el buffer
-                    buffer = torch.empty((1,0),dtype=torch.int64)
+                    buffer = torch.empty((1,0),dtype=torch.float32, device=mps_device)
 
                 # Si el buffer no está lleno, sigue cargando el buffer
                 else:
